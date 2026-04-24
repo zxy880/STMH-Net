@@ -1,0 +1,159 @@
+import torch
+from utils.loss import ComputeLoss
+from utils.metrics import bbox_iou
+from utils.torch_utils import de_parallel
+
+
+class ComputeLossHSM(ComputeLoss):
+    """
+    HSM-Box Loss
+    Head-aligned Scale-Morphology Box Loss
+
+    设计目标：
+    - 保留 YOLOv5 原始 cls / obj / target assignment
+    - 仅增强 box regression
+    - P3: 强化 tiny/small 的中心与尺度稳定性
+    - P4: 强化 medium 尤其细长舰船的形态拟合
+    - P5: 保持 baseline，不额外加项
+
+    约定：
+    - i == 0 -> P3
+    - i == 1 -> P4
+    - i == 2 -> P5
+
+    注意：
+    - 默认你的 Detect 顺序是 [P3, P4, P5]
+    - 如果你后续改了 Detect 顺序，需要同步改这里的分支逻辑
+    """
+
+    def __init__(self, model, autobalance=False):
+        super().__init__(model, autobalance)
+
+        self.eps = 1e-9
+
+        det = de_parallel(model).model[-1]
+        if isinstance(det.stride, torch.Tensor):
+            self.stride = det.stride.detach().clone().float()
+        else:
+            self.stride = torch.tensor(det.stride, dtype=torch.float32)
+
+        self.lambda_c = float(self.hyp.get("hsm_lambda_c", 0.24))
+        self.lambda_s = float(self.hyp.get("hsm_lambda_s", 0.14))
+
+        self.lambda_pc = float(self.hyp.get("hsm_lambda_pc", 0.04))
+        self.lambda_r = float(self.hyp.get("hsm_lambda_r", 0.10))
+
+        self.beta = float(self.hyp.get("hsm_beta", 0.60))
+        self.tau = float(self.hyp.get("hsm_tau", 28.0))
+
+        self.kappa = float(self.hyp.get("hsm_kappa", 0.18))
+
+        self.hsm_start_epoch = int(self.hyp.get("hsm_start_epoch", 10))
+        self.hsm_ramp_epochs = int(self.hyp.get("hsm_ramp_epochs", 15))
+        self.hsm_gain = 0.0 if self.hsm_start_epoch > 0 else 1.0
+
+    def set_epoch(self, epoch: int):
+        if epoch < self.hsm_start_epoch:
+            self.hsm_gain = 0.0
+        elif self.hsm_ramp_epochs <= 0:
+            self.hsm_gain = 1.0
+        else:
+            self.hsm_gain = min(1.0, (epoch - self.hsm_start_epoch + 1) / float(self.hsm_ramp_epochs))
+
+    def _center_loss(self, pxy, txy, twh):
+        denom = (twh[:, 0] ** 2 + twh[:, 1] ** 2).clamp(min=self.eps)
+        d2 = (pxy[:, 0] - txy[:, 0]) ** 2 + (pxy[:, 1] - txy[:, 1]) ** 2
+        return d2 / denom
+
+    def _size_loss(self, pwh, twh):
+        lw = torch.log((pwh[:, 0] + self.eps) / (twh[:, 0] + self.eps))
+        lh = torch.log((pwh[:, 1] + self.eps) / (twh[:, 1] + self.eps))
+        return lw ** 2 + lh ** 2
+
+    def _ratio_loss(self, pwh, twh):
+        pr = torch.log((pwh[:, 0] + self.eps) / (pwh[:, 1] + self.eps))
+        tr = torch.log((twh[:, 0] + self.eps) / (twh[:, 1] + self.eps))
+        return (pr - tr) ** 2
+
+    def _scale_weight(self, twh_px):
+        tsize = (twh_px[:, 0] * twh_px[:, 1]).clamp(min=self.eps).sqrt()
+        return 1.0 + self.beta * torch.exp(-tsize / self.tau)
+
+    def _elongation_weight(self, twh):
+        elong = torch.abs(torch.log((twh[:, 0] + self.eps) / (twh[:, 1] + self.eps)))
+        return 1.0 + self.kappa * elong
+
+    def __call__(self, p, targets, imgs=None):
+        device = targets.device
+        lcls = torch.zeros(1, device=device)
+        lbox = torch.zeros(1, device=device)
+        lobj = torch.zeros(1, device=device)
+
+        tcls, tbox, indices, anchors = self.build_targets(p, targets)
+
+        for i, pi in enumerate(p):
+            b, a, gj, gi = indices[i]
+            tobj = torch.zeros(pi.shape[:4], dtype=pi.dtype, device=device)
+
+            n = b.shape[0]
+            if n:
+                ps = pi[b, a, gj, gi]
+
+                pxy = ps[:, :2].sigmoid() * 2.0 - 0.5
+                pwh = (ps[:, 2:4].sigmoid() * 2.0) ** 2 * anchors[i]
+                pbox = torch.cat((pxy, pwh), 1)
+
+                txy = tbox[i][:, :2]
+                twh = tbox[i][:, 2:4].clamp(min=self.eps)
+
+                ciou = bbox_iou(pbox, tbox[i], xywh=True, CIoU=True, eps=self.eps).squeeze()
+                base_box = (1.0 - ciou).mean()
+
+                extra_box = torch.zeros_like(base_box)
+
+                if self.hsm_gain > 0:
+                    stride_i = float(self.stride[i])
+                    twh_px = twh * stride_i
+
+                    if i == 0:
+                        w_s = self._scale_weight(twh_px)
+                        l_ctr = self._center_loss(pxy, txy, twh)
+                        l_sz = self._size_loss(pwh, twh)
+                        extra_box = (w_s * (self.lambda_c * l_ctr + self.lambda_s * l_sz)).mean()
+
+                    elif i == 1:
+                        w_e = self._elongation_weight(twh)
+                        l_ctr = self._center_loss(pxy, txy, twh)
+                        l_rat = self._ratio_loss(pwh, twh)
+                        extra_box = (self.lambda_pc * l_ctr + w_e * self.lambda_r * l_rat).mean()
+
+                lbox += base_box + self.hsm_gain * extra_box
+
+                iou_detached = ciou.detach().clamp(0).type(tobj.dtype)
+                if self.sort_obj_iou:
+                    j = iou_detached.argsort()
+                    b, a, gj, gi, iou_detached = b[j], a[j], gj[j], gi[j], iou_detached[j]
+                if self.gr < 1:
+                    iou_detached = (1.0 - self.gr) + self.gr * iou_detached
+                tobj[b, a, gj, gi] = iou_detached
+
+                if self.nc > 1:
+                    t = torch.full_like(ps[:, 5:], self.cn, device=device)
+                    t[range(n), tcls[i]] = self.cp
+                    lcls += self.BCEcls(ps[:, 5:], t)
+
+            obji = self.BCEobj(pi[..., 4], tobj)
+            lobj += obji * self.balance[i]
+            if self.autobalance:
+                self.balance[i] = self.balance[i] * 0.9999 + 0.0001 / obji.detach().item()
+
+        if self.autobalance:
+            self.balance = [x / self.balance[self.ssi] for x in self.balance]
+
+        lbox *= self.hyp["box"]
+        lobj *= self.hyp["obj"]
+        lcls *= self.hyp["cls"]
+
+        bs = p[0].shape[0]
+        total = (lbox + lobj + lcls) * bs
+        return total, torch.cat((lbox, lobj, lcls)).detach()
