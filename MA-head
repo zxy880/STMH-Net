@@ -1,0 +1,151 @@
+import math
+import torch
+import torch.nn as nn
+
+
+def _pad(k):
+    if isinstance(k, int):
+        return k // 2
+    elif isinstance(k, (tuple, list)):
+        return tuple(kk // 2 for kk in k)
+    else:
+        raise TypeError(f'Unsupported kernel type: {type(k)}')
+
+
+class Conv(nn.Module):
+    """Convolution-BN-Activation block."""
+    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, act=True):
+        super().__init__()
+        if p is None:
+            p = _pad(k)
+        self.conv = nn.Conv2d(c1, c2, k, s, padding=p, groups=g, bias=False)
+        self.bn = nn.BatchNorm2d(c2)
+        if act is True:
+            self.act = nn.SiLU()
+        elif isinstance(act, nn.Module):
+            self.act = act
+        else:
+            self.act = nn.Identity()
+
+    def forward(self, x):
+        return self.act(self.bn(self.conv(x)))
+
+
+class DepthwiseConvBNAct(nn.Module):
+    """Depthwise convolution with BN and activation."""
+    def __init__(self, c, k=3, s=1, act=True):
+        super().__init__()
+        self.conv = nn.Conv2d(c, c, k, s, padding=_pad(k), groups=c, bias=False)
+        self.bn = nn.BatchNorm2d(c)
+        if act is True:
+            self.act = nn.SiLU()
+        elif isinstance(act, nn.Module):
+            self.act = act
+        else:
+            self.act = nn.Identity()
+
+    def forward(self, x):
+        return self.act(self.bn(self.conv(x)))
+
+
+class ECABlock(nn.Module):
+    """Efficient Channel Attention used for lightweight channel calibration."""
+    def __init__(self, c, k_size=3):
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.conv = nn.Conv1d(
+            1, 1,
+            kernel_size=k_size,
+            padding=(k_size - 1) // 2,
+            bias=False
+        )
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        y = self.avg_pool(x)                                  # [B, C, 1, 1]
+        y = y.squeeze(-1).transpose(-1, -2)                  # [B, 1, C]
+        y = self.conv(y)                                     # [B, 1, C]
+        y = self.sigmoid(y).transpose(-1, -2).unsqueeze(-1)  # [B, C, 1, 1]
+        return x * y.expand_as(x)
+
+
+class MorphologyAwareHead(nn.Module):
+    """
+    Morphology-Aware Head (MA Head).
+
+    The MA Head is designed for the medium-resolution prediction branch
+    to enhance morphology-sensitive feature aggregation for elongated
+    SAR ship targets.
+
+    Structure:
+        1) Channel reduction
+        2) Local depthwise aggregation with 3x3 DWConv
+        3) Horizontal and vertical strip-wise morphology modeling
+           using 1x5 and 5x1 DWConv
+        4) Morphology-aware feature fusion
+        5) Lightweight channel calibration with ECA
+        6) Channel expansion and residual fusion
+    """
+    def __init__(self, c1, c2, e=0.5, alpha=0.5, eca_k=3):
+        super().__init__()
+        assert c2 > 0
+        hidden_channels = max(int(c2 * e), 32)
+
+        # Channel reduction
+        self.channel_reduce = Conv(c1, hidden_channels, 1, 1)
+
+        # Local depthwise aggregation
+        self.local_dwconv = DepthwiseConvBNAct(
+            hidden_channels, k=3, s=1, act=True
+        )
+
+        # Strip-wise morphology modeling
+        self.horizontal_morphology = DepthwiseConvBNAct(
+            hidden_channels, k=(1, 5), s=1, act=True
+        )
+        self.vertical_morphology = DepthwiseConvBNAct(
+            hidden_channels, k=(5, 1), s=1, act=True
+        )
+
+        # Morphology-aware feature fusion
+        self.morphology_fusion = Conv(hidden_channels * 2, hidden_channels, 1, 1)
+
+        # Lightweight channel calibration
+        self.channel_calibration = ECABlock(hidden_channels, k_size=eca_k)
+
+        # Channel expansion
+        self.channel_expand = Conv(hidden_channels, c2, 1, 1, act=False)
+
+        # Residual shortcut
+        self.shortcut = nn.Identity() if c1 == c2 else Conv(c1, c2, 1, 1, act=False)
+
+        # Learnable residual scaling
+        self.residual_scale = nn.Parameter(
+            torch.tensor(float(alpha), dtype=torch.float32)
+        )
+        self.activation = nn.SiLU()
+
+    def forward(self, x):
+        identity = self.shortcut(x)
+
+        x_reduced = self.channel_reduce(x)
+
+        local_feature = self.local_dwconv(x_reduced)
+
+        morphology_feature = (
+            self.horizontal_morphology(local_feature)
+            + self.vertical_morphology(local_feature)
+        )
+
+        fused_feature = torch.cat((local_feature, morphology_feature), dim=1)
+        fused_feature = self.morphology_fusion(fused_feature)
+        fused_feature = self.channel_calibration(fused_feature)
+        fused_feature = self.channel_expand(fused_feature)
+
+        out = identity + self.residual_scale * fused_feature
+        return self.activation(out)
+
+
+# Optional alias.
+# Use this if your model yaml or parser calls the module as MAHead.
+MAHead = MorphologyAwareHead
