@@ -10,7 +10,7 @@ class ComputeLossHSM(ComputeLoss):
     Head-aligned Scale-Morphology Box Loss
 
     设计目标：
-    - 保留 YOLOv5 原始 cls / obj / target assignment
+    - 保留 YOLO 原始 cls / obj / target assignment
     - 仅增强 box regression
     - P3: 强化 tiny/small 的中心与尺度稳定性
     - P4: 强化 medium 尤其细长舰船的形态拟合
